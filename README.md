@@ -13,12 +13,39 @@ sources through OLE DB in a repeatable way.
 - Creates matching local tables (DAO TableDefs/Fields)
 - Attempts to create primary keys (via `adSchemaPrimaryKeys`)
 - Copies all rows into local tables in batched transactions
+- Matches source columns to local columns **by name**, so re-running against an
+  existing local table with a different column order stays correct
+- Continues past a table it cannot clone, then reports every failure at the end
 
-## What it does NOT do (This is going to be implemented at a later date)
+## Planned
 
-- Recreate non-PK indexes, constraints, foreign keys, triggers, views, stored procedures
-- Perfectly replicate identity/autonumber semantics from SQL Server
-- Guarantee BigInt support (mapped to `dbLong`)
+- Recreate non-PK indexes (via `adSchemaIndexes`)
+- Recreate foreign keys as DAO `Relations` (needs dependency-ordered creation;
+  will not handle cyclic or self-referencing schemas)
+
+## What it will not do
+
+These are limitations of Access itself, not gaps in the script:
+
+- **Triggers, stored procedures, views.** Access has no equivalent for the first
+  two; view definitions are T-SQL and do not translate to Access SQL.
+- **CHECK constraints.** Access's support is too inconsistent to rely on.
+- **Identity/autonumber semantics.** Access reassigns autonumber values on
+  insert, so preserving the *source* values means storing them as plain numbers.
+  That is what this script does, and it is the correct trade-off for a clone —
+  the values match, but the local column will not auto-increment.
+
+## Type mapping notes
+
+- **64-bit integers** (`adBigInt`, `adUnsignedInt`, `adUnsignedBigInt`) map to
+  `dbBigInt` where the Access engine supports it. Support is probed once at
+  runtime; where unavailable they fall back to `dbDouble`, which covers the full
+  range but is only exact up to 2^53. (They are *not* mapped to `dbLong`, which
+  would silently overflow.)
+- **GUIDs** are stored as 38-char text — the width of the string form, not the
+  16-byte `DefinedSize` the provider reports.
+- **`adDecimal` / `adNumeric`** map to `dbDouble` and can lose precision on
+  high-precision decimal columns. Known limitation.
 
 ## Requirements
 
@@ -44,3 +71,13 @@ Public Sub RunClone()
     CloneOleDbToAccess_Default conn
 End Sub
 ```
+
+Note that `CloneOleDbToAccess_Default` is the opinionated preset (replace tables,
+batch 500, verbose, skip system tables). If you pass your own `CloneOptions`, the
+Boolean fields default to `False` — an unset VBA `Boolean` is indistinguishable
+from an explicit `False`, so set the ones you want. See
+[`example/example_runclone.bas`](example/example_runclone.bas).
+
+## License
+
+[MIT](LICENSE) © Gabriel Geissler
