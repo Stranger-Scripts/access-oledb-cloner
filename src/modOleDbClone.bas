@@ -14,6 +14,20 @@ Option Explicit
 ' =============================================================================
 
 ' ---------------------------
+' CONSTANTS
+' ---------------------------
+
+' dbBigInt is only defined in newer DAO type libraries. Referencing the named
+' constant would break compilation on older Access installs, so use the literal.
+Private Const DAO_dbBigInt As Long = 16
+
+' Length of a GUID in its string form: {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
+Private Const GUID_TEXT_SIZE As Long = 38
+
+Private mBigIntProbed As Boolean
+Private mBigIntSupported As Boolean
+
+' ---------------------------
 ' PUBLIC API
 ' ---------------------------
 
@@ -33,6 +47,8 @@ Public Sub CloneOleDbToAccess( _
     Dim cn As Object        ' ADODB.Connection (late bound)
     Dim rsTables As Object  ' ADODB.Recordset
     Dim tblName As String
+    Dim failures As String
+    Dim failCount As Long
 
     ApplyDefaultOptions options
 
@@ -47,7 +63,17 @@ Public Sub CloneOleDbToAccess( _
 
         If ShouldProcessTable(tblName, options) Then
             If options.Verbose Then Debug.Print "Schema for: "; tblName
+
+            ' A single unclonable table must not abort the whole run.
+            On Error Resume Next
             CreateTableWithSchema cn, tblName, options
+            If Err.Number <> 0 Then
+                failCount = failCount + 1
+                failures = failures & vbCrLf & "  schema [" & tblName & "]: " & Err.Description
+                Debug.Print "SCHEMA FAILED for [" & tblName & "]: " & Err.Description
+                Err.Clear
+            End If
+            On Error GoTo 0
         End If
 
         rsTables.MoveNext
@@ -63,7 +89,16 @@ Public Sub CloneOleDbToAccess( _
         If ShouldProcessTable(tblName, options) Then
             If TableExists(tblName) Then
                 If options.Verbose Then Debug.Print "Copying data for: "; tblName
+
+                On Error Resume Next
                 BulkCopyTableData cn, tblName, options
+                If Err.Number <> 0 Then
+                    failCount = failCount + 1
+                    failures = failures & vbCrLf & "  data [" & tblName & "]: " & Err.Description
+                    Debug.Print "DATA COPY FAILED for [" & tblName & "]: " & Err.Description
+                    Err.Clear
+                End If
+                On Error GoTo 0
             End If
         End If
 
@@ -74,7 +109,12 @@ Public Sub CloneOleDbToAccess( _
     cn.Close
     Set cn = Nothing
 
-    MsgBox "Done cloning DB (schema + data).", vbInformation
+    If failCount = 0 Then
+        MsgBox "Done cloning DB (schema + data).", vbInformation
+    Else
+        MsgBox "Clone finished with " & failCount & " failure(s):" & vbCrLf & failures & _
+               vbCrLf & vbCrLf & "See the Immediate window for details.", vbExclamation
+    End If
 End Sub
 
 ' Convenience wrapper for people who like “one-liner” entry points
@@ -122,13 +162,20 @@ Private Sub CreateTableWithSchema(ByVal cn As Object, ByVal tableName As String,
         Dim adoFld As Object ' ADODB.Field
 
         Set adoFld = rsData.Fields(i)
-        daoType = MapADOToDAOType(adoFld)
+        daoType = MapADOToDAOType(adoFld, options)
 
         Set fld = tdf.CreateField(CStr(adoFld.Name), daoType)
 
         If daoType = dbText Then
-            txtSize = CLng(Nz(adoFld.DefinedSize, 0))
-            If txtSize <= 0 Or txtSize > 255 Then txtSize = 255
+            If CLng(adoFld.Type) = 72 Then
+                ' adGUID reports DefinedSize = 16 (its binary width), but the
+                ' string form is 38 chars. Sizing from DefinedSize would
+                ' silently truncate every GUID on copy.
+                txtSize = GUID_TEXT_SIZE
+            Else
+                txtSize = CLng(Nz(adoFld.DefinedSize, 0))
+                If txtSize <= 0 Or txtSize > 255 Then txtSize = 255
+            End If
             fld.Size = txtSize
         End If
 
@@ -210,6 +257,8 @@ Private Sub BulkCopyTableData(ByVal cn As Object, ByVal tableName As String, ByR
     Dim i As Long
     Dim v As Variant
     Dim rowCount As Long
+    Dim inTrans As Boolean
+    Dim targets() As Object  ' local DAO field per source ordinal; Nothing = skip
 
     Set db = CurrentDb()
     Set wrk = DBEngine.Workspaces(0)
@@ -224,15 +273,39 @@ Private Sub BulkCopyTableData(ByVal cn As Object, ByVal tableName As String, ByR
 
     Set rstLocal = db.OpenRecordset(tableName, dbOpenDynaset)
 
+    ' Resolve source ordinal -> local field by NAME, once. Matching by ordinal
+    ' only holds when we created the table ourselves this run; with
+    ' ReplaceLocalTables = False the local table may have a different column
+    ' order, which would write every value into the wrong column.
+    ReDim targets(0 To rs.Fields.Count - 1)
+    For i = 0 To rs.Fields.Count - 1
+        On Error Resume Next
+        Set targets(i) = rstLocal.Fields(CStr(rs.Fields(i).Name))
+        If Err.Number <> 0 Then
+            Set targets(i) = Nothing
+            If options.Verbose Then
+                Debug.Print "  no local column for [" & tableName & "].[" & _
+                            rs.Fields(i).Name & "] -> skipped"
+            End If
+            Err.Clear
+        End If
+        On Error GoTo 0
+    Next i
+
+    On Error GoTo CopyErr
+
     rowCount = 0
     wrk.BeginTrans
+    inTrans = True
 
     Do While Not rs.EOF
         rstLocal.AddNew
 
         For i = 0 To rs.Fields.Count - 1
-            v = rs.Fields(i).Value
-            AssignVariantToDaoField rstLocal.Fields(i), v
+            If Not targets(i) Is Nothing Then
+                v = rs.Fields(i).Value
+                AssignVariantToDaoField targets(i), v
+            End If
         Next i
 
         rstLocal.Update
@@ -249,25 +322,56 @@ Private Sub BulkCopyTableData(ByVal cn As Object, ByVal tableName As String, ByR
     Loop
 
     wrk.CommitTrans
+    inTrans = False
 
     rstLocal.Close
     rs.Close
+    Exit Sub
+
+CopyErr:
+    Dim errNum As Long, errDesc As String
+    errNum = Err.Number
+    errDesc = Err.Description
+
+    On Error Resume Next
+    ' Roll back only the uncommitted batch; earlier batches stay committed.
+    If inTrans Then wrk.Rollback
+    If Not rstLocal Is Nothing Then rstLocal.Close
+    If Not rs Is Nothing Then rs.Close
+    On Error GoTo 0
+
+    Err.Raise errNum, "BulkCopyTableData", _
+              errDesc & " (after " & rowCount & " row(s))"
 End Sub
 
 ' ---------------------------
 ' TYPE MAPPING (ADO -> DAO)
 ' ---------------------------
 
-Private Function MapADOToDAOType(ByVal f As Object) As Long
+Private Function MapADOToDAOType(ByVal f As Object, ByRef options As CloneOptions) As Long
     ' f.Type is ADODB.DataTypeEnum; numeric values are stable.
     Select Case CLng(f.Type)
 
-        ' Integers
-        Case 16, 2, 3 ' adTinyInt=16, adSmallInt=2, adInteger=3
+        ' Integers that fit in a signed 32-bit dbLong
+        ' adTinyInt=16, adSmallInt=2, adInteger=3,
+        ' adUnsignedTinyInt=17, adUnsignedSmallInt=18
+        Case 16, 2, 3, 17, 18
             MapADOToDAOType = dbLong
 
-        Case 20, 19, 18, 17 ' adBigInt=20, unsigned ints...
-            MapADOToDAOType = dbLong ' Access fallback
+        ' Values that overflow dbLong: adUnsignedInt=19 (max 4294967295),
+        ' adBigInt=20, adUnsignedBigInt=21.
+        Case 19, 20, 21
+            If BigIntSupported() Then
+                MapADOToDAOType = DAO_dbBigInt
+            Else
+                ' dbDouble holds the full range and is exact up to 2^53.
+                ' dbLong would silently overflow, so this is the safer fallback.
+                MapADOToDAOType = dbDouble
+                If options.Verbose Then
+                    Debug.Print "  64-bit column [" & f.Name & "] -> dbDouble " & _
+                                "(dbBigInt unavailable; values above 2^53 lose precision)"
+                End If
+            End If
 
         ' Floats / numeric
         Case 4 ' adSingle
@@ -351,7 +455,7 @@ Private Sub AssignVariantToDaoField(ByVal fld As DAO.Field, ByVal v As Variant)
         Case dbLongBinary
             fld.Value = v
 
-        Case dbInteger, dbLong, dbSingle, dbDouble, dbCurrency, dbDate, dbBoolean
+        Case dbInteger, dbLong, dbSingle, dbDouble, dbCurrency, dbDate, dbBoolean, DAO_dbBigInt
             If vt = vbString Then
                 s = Trim$(CStr(v))
                 If s = vbNullString Then
@@ -363,6 +467,8 @@ Private Sub AssignVariantToDaoField(ByVal fld As DAO.Field, ByVal v As Variant)
             On Error GoTo ConvErr
             Select Case fld.Type
                 Case dbInteger, dbLong: fld.Value = CLng(v)
+                ' VBA has no native Int64; Decimal carries the full range exactly.
+                Case DAO_dbBigInt: fld.Value = CDec(v)
                 Case dbSingle: fld.Value = CSng(v)
                 Case dbDouble: fld.Value = CDbl(v)
                 Case dbCurrency: fld.Value = CCur(v)
@@ -382,6 +488,43 @@ ConvErr:
             fld.Value = v
     End Select
 End Sub
+
+' dbBigInt requires a recent ACE engine AND a database file format that supports
+' it, so the only reliable test is to actually create such a field. Probed once
+' per session and cached.
+Private Function BigIntSupported() As Boolean
+    Const PROBE_TABLE As String = "~tmpBigIntProbe"
+
+    Dim db As DAO.Database
+    Dim tdf As DAO.TableDef
+
+    If mBigIntProbed Then
+        BigIntSupported = mBigIntSupported
+        Exit Function
+    End If
+
+    Set db = CurrentDb()
+
+    On Error Resume Next
+
+    db.TableDefs.Delete PROBE_TABLE   ' leftover from an aborted earlier run
+    Err.Clear
+
+    Set tdf = db.CreateTableDef(PROBE_TABLE)
+    tdf.Fields.Append tdf.CreateField("v", DAO_dbBigInt)
+    db.TableDefs.Append tdf
+
+    mBigIntSupported = (Err.Number = 0)
+    Err.Clear
+
+    db.TableDefs.Delete PROBE_TABLE
+    Err.Clear
+
+    On Error GoTo 0
+
+    mBigIntProbed = True
+    BigIntSupported = mBigIntSupported
+End Function
 
 Private Function TableExists(ByVal tableName As String) As Boolean
     Dim tdf As DAO.TableDef
@@ -406,14 +549,12 @@ Private Function ShouldProcessTable(ByVal tableName As String, ByRef options As 
 End Function
 
 Private Sub ApplyDefaultOptions(ByRef options As CloneOptions)
+    ' Booleans cannot be defaulted here: an unset CloneOptions is already False,
+    ' so there is no way to tell "not specified" from "explicitly False".
+    ' ReplaceLocalTables / SkipSystemTables / Verbose therefore default to False.    ' Booleans cannot be defaulted here: an unset CloneOptions is already False,
+    ' so there is no way to tell "not specified" from "explicitly False".
+    ' ReplaceLocalTables / SkipSystemTables / Verbose therefore default to False.
+    ' Use CloneOleDbToAccess_Default for the opinionated clone-semantics preset.
+    ' Use CloneOleDbToAccess_Default for the opinionated clone-semantics preset.
     If options.BatchSize <= 0 Then options.BatchSize = 500
-    ' Default behavior: replace tables for "clone" semantics
-    ' (User can set false explicitly)
-    If options.ReplaceLocalTables = False Then
-        ' leave as provided
-    End If
-    If options.SkipSystemTables = False Then
-        ' leave as provided
-    End If
-    ' Verbose default false
 End Sub
